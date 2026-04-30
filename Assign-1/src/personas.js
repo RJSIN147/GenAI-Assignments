@@ -8,14 +8,17 @@ export const personas = {
     name: 'Anshuman Singh',
     title: 'Co-founder, Scaler & InterviewBit',
     avatar: 'AS',
+    emoji: '🚀',
+    tagline: 'Ex-Facebook · 2× ICPC World Finalist',
+    description: 'Co-founder of Scaler & InterviewBit. Built Facebook Messenger. Believes coding is a superpower and education is about addiction, not content.',
     accentColor: '#6C63FF',
     accentGradient: 'linear-gradient(135deg, #6C63FF 0%, #4834DF 100%)',
 
     suggestionChips: [
-      'How do I prepare for FAANG interviews?',
-      'Is competitive programming worth it?',
-      'How did you build Scaler from scratch?',
-      'What makes a great software engineer?',
+      { text: 'How do I prepare for FAANG interviews?', icon: '🎯' },
+      { text: 'Is competitive programming worth it?', icon: '💻' },
+      { text: 'How did you build Scaler from scratch?', icon: '🏗️' },
+      { text: 'What makes a great software engineer?', icon: '⭐' },
     ],
 
     systemPrompt: `You are Anshuman Singh — co-founder of InterviewBit and Scaler (formerly Scaler Academy).
@@ -73,14 +76,17 @@ Do NOT output your reasoning — only deliver the final polished response.
     name: 'Abhimanyu Saxena',
     title: 'Co-founder, Scaler & InterviewBit',
     avatar: 'AX',
+    emoji: '🧭',
+    tagline: 'TEDx Speaker · First-Principles Thinker',
+    description: 'Co-founder of Scaler & InterviewBit. Sold his first startup in college. TEDx speaker on navigating life\'s U-turns with the Compass & Map framework.',
     accentColor: '#00B894',
     accentGradient: 'linear-gradient(135deg, #00B894 0%, #00A381 100%)',
 
     suggestionChips: [
-      'How do I choose the right startup idea?',
-      'What\'s your hiring philosophy?',
-      'How do you handle pivots and failure?',
-      'What does first-principles thinking mean?',
+      { text: 'How do I choose the right startup idea?', icon: '💡' },
+      { text: 'What\'s your hiring philosophy?', icon: '👥' },
+      { text: 'How do you handle pivots and failure?', icon: '🔄' },
+      { text: 'What does first-principles thinking mean?', icon: '🧠' },
     ],
 
     systemPrompt: `You are Abhimanyu Saxena — co-founder of InterviewBit and Scaler (formerly Scaler Academy).
@@ -139,14 +145,17 @@ Do NOT output your reasoning — only deliver the final polished response.
     name: 'Kshitij Mishra',
     title: 'Head of Instructors, Scaler',
     avatar: 'KM',
+    emoji: '📚',
+    tagline: 'DSA Guru · 10+ Years in Engineering',
+    description: 'Head of Instructors at Scaler. Known as the "God of DSA" by students. Believes in simplifying complexity through visualization and pattern recognition.',
     accentColor: '#E17055',
     accentGradient: 'linear-gradient(135deg, #E17055 0%, #D63031 100%)',
 
     suggestionChips: [
-      'How do I get better at dynamic programming?',
-      'I\'m stuck on a hard problem — help!',
-      'What\'s the best way to learn DSA?',
-      'How important are fundamentals for interviews?',
+      { text: 'How do I get better at dynamic programming?', icon: '🧩' },
+      { text: 'I\'m stuck on a hard problem — help!', icon: '🆘' },
+      { text: 'What\'s the best way to learn DSA?', icon: '📖' },
+      { text: 'How important are fundamentals for interviews?', icon: '🏆' },
     ],
 
     systemPrompt: `You are Kshitij Mishra — Head of Instructors at Scaler (formerly Scaler Academy).
