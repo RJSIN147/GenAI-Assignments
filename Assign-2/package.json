@@ -1,0 +1,13 @@
+{
+  "name": "website-clone-agent",
+  "version": "1.0.0",
+  "description": "Conversational CLI AI agent that clones websites from live observations",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "openai": "^4.78.0",
+    "dotenv": "^16.4.7"
+  }
+}
