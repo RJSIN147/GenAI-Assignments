@@ -71,7 +71,3 @@ Assign-2/
 ├── README.md
 └── output/           # Generated clone files
 ```
-
-## Notes
-
-This project does not use a prebuilt Scaler template. The clone is generated from live page evidence returned by the scraper.
