@@ -12,10 +12,16 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import pdf from "pdf-parse";
-import { pipeline } from "@xenova/transformers";
+import { pipeline, env } from "@xenova/transformers";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { OpenAI } from "openai";
+
+// Point the model cache at a writable path inside the project directory.
+// This is required on platforms like Railway where $HOME may not be writable.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+env.cacheDir = path.join(__dirname, ".model-cache");
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -89,24 +95,23 @@ async function loadDocument(filePath) {
 
 async function loadPDF(filePath) {
   const buffer = fs.readFileSync(filePath);
-  const pages = [];
-  let pageNum = 0;
 
-  await pdf(buffer, {
-    pagerender: async (pageData) => {
-      pageNum++;
-      const textContent = await pageData.getTextContent();
-      const text = textContent.items
-        .map((item) => item.str)
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (text) pages.push({ pageNumber: pageNum, text });
-      return text;
-    },
-  });
+  // Use pdf-parse's standard API — the custom `pagerender` hook is
+  // undocumented, version-sensitive, and silently returns nothing in
+  // many versions of the library.
+  const data = await pdf(buffer);
 
-  return pages;
+  if (!data.text || !data.text.trim()) return [];
+
+  // Split the full text into per-page chunks using the form-feed
+  // character that pdf-parse inserts between pages (when present),
+  // falling back to treating the whole document as a single page.
+  const rawPages = data.text.split(/\f/);
+  const pages = rawPages
+    .map((text, i) => ({ pageNumber: i + 1, text: text.replace(/\s+/g, " ").trim() }))
+    .filter((p) => p.text.length > 0);
+
+  return pages.length > 0 ? pages : [{ pageNumber: 1, text: data.text.trim() }];
 }
 
 async function loadText(filePath) {
