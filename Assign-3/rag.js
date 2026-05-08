@@ -62,20 +62,28 @@ async function embedText(text) {
   return Array.from(output.data);
 }
 
-/** Embed an array of strings with an optional progress callback. */
+/**
+ * Embed an array of strings in a single batched forward pass.
+ * This is significantly faster than looping one-by-one because
+ * the ONNX runtime processes all texts together in one call.
+ */
 async function embedBatch(texts, onProgress) {
   const extractor = await getEmbedder();
-  const embeddings = [];
 
+  if (onProgress) onProgress(0, texts.length);
+
+  // Pass the entire array at once — Xenova batches internally.
+  const output = await extractor(texts, { pooling: "mean", normalize: true });
+
+  // output.data is a flat Float32Array of shape [N × EMBEDDING_DIM].
+  // Slice it into per-text arrays.
+  const embeddings = [];
   for (let i = 0; i < texts.length; i++) {
-    const output = await extractor(texts[i], {
-      pooling: "mean",
-      normalize: true,
-    });
-    embeddings.push(Array.from(output.data));
-    if (onProgress) onProgress(i + 1, texts.length);
+    const start = i * EMBEDDING_DIM;
+    embeddings.push(Array.from(output.data.slice(start, start + EMBEDDING_DIM)));
   }
 
+  if (onProgress) onProgress(texts.length, texts.length);
   return embeddings;
 }
 
