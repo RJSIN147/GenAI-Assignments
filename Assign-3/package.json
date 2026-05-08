@@ -4,6 +4,7 @@
   "description": "Google NotebookLM RAG clone — upload documents and chat with them",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/download-model.js",
     "start": "node server.js",
     "dev": "node --watch server.js",
     "build:frontend": "cd frontend && npm run build"
