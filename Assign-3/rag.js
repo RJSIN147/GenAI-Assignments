@@ -291,10 +291,10 @@ async function chat(question, collectionName) {
   // 1 — Embed the question
   const queryVector = await embedText(question);
 
-  // 2 — Retrieve top-5 similar chunks
+  // 2 — Retrieve top-3 similar chunks
   const results = await qdrant.search(collectionName, {
     vector: queryVector,
-    limit: 5,
+    limit: 3,
     with_payload: true,
   });
 
