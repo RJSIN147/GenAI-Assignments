@@ -24,7 +24,10 @@ const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 const EMBEDDING_DIM = 384;
 const LLM_MODEL = process.env.MODEL_NAME || 'nvidia/nemotron-3-super-120b-a12b:free';
 
-const qdrant = new QdrantClient({ url: QDRANT_URL });
+const qdrant = new QdrantClient({
+  url: QDRANT_URL,
+  apiKey: process.env.QDRANT_API_KEY, // Added for Qdrant Cloud support
+});
 
 const openai = new OpenAI({
   baseURL: process.env.BASE_URL || "https://openrouter.ai/api/v1",

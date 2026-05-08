@@ -80,7 +80,11 @@ app.post("/api/upload", upload.single("document"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const result = await indexDocument(req.file.path, req.file.originalname);
+    const onProgress = (stage, message) => {
+      console.log(`  [${stage.toUpperCase()}] ${message}`);
+    };
+
+    const result = await indexDocument(req.file.path, req.file.originalname, onProgress);
 
     // Persist metadata
     collectionsMap[result.collectionName] = {
