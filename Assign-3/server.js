@@ -228,7 +228,10 @@ app.listen(PORT, async () => {
     await getEmbedder();
     console.log("✅  Embedding model ready!\n");
   } catch (err) {
-    console.error("⚠️  Embedding model failed to load:", err.message);
-    console.error("    Uploads will fail until the model is available.");
+    // Exit immediately so Railway/the process manager restarts with a clear error.
+    // A server running without the embedding model will OOM or fail mid-request,
+    // producing misleading errors like "question and collectionName are required".
+    console.error("❌  Embedding model failed to load — shutting down:", err.message);
+    process.exit(1);
   }
 });

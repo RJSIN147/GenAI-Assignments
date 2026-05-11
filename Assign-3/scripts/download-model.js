@@ -21,6 +21,8 @@ try {
   await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
   console.log("✅  Embedding model ready!\n");
 } catch (err) {
-  // Don't fail the install — the server will retry at startup.
-  console.warn("⚠️  Model pre-download failed (will retry at startup):", err.message);
+  // Fail loudly — if the model can't download at build time, the server
+  // will OOM or time out at runtime trying to download it mid-request.
+  console.error("❌  Model download failed:", err.message);
+  process.exit(1);
 }
