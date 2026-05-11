@@ -31,6 +31,10 @@ const qdrant = new QdrantClient({
 const openai = new OpenAI({
   baseURL: process.env.BASE_URL || "https://openrouter.ai/api/v1",
   apiKey: process.env.OPENROUTER_API_KEY,
+  defaultHeaders: {
+    "HTTP-Referer": "https://github.com/google-gemini/gemini-cli", // Required for OpenRouter
+    "X-Title": "NotebookLM-Clone",
+  },
 });
 
 // ── Remote Embedding ───────────────────────────────────────────────────────────
