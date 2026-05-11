@@ -1,38 +1,31 @@
 /**
- * rag.js — Complete RAG Pipeline
+ * rag.js — Advanced RAG Pipeline
  *
- * Handles the full Retrieval-Augmented Generation flow:
- *   1. Document Loading (PDF / TXT)
- *   2. Chunking (RecursiveCharacterTextSplitter)
- *   3. Embedding (local, via @xenova/transformers)
- *   4. Indexing (Qdrant vector store)
- *   5. Retrieval (semantic similarity search)
- *   6. Generation (LLM via OpenRouter)
+ * Upgraded to handle large (300+ page) PDFs by:
+ *   1. Using Remote Embeddings (OpenAI/OpenRouter)
+ *   2. Implementing Query Expansion
+ *   3. Implementing Reranking
  */
 
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import pdf from "pdf-parse";
-import { pipeline, env } from "@xenova/transformers";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { OpenAI } from "openai";
 
-// Point the model cache at a writable path inside the project directory.
-// This is required on platforms like Railway where $HOME may not be writable.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-env.cacheDir = path.join(__dirname, ".model-cache");
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 
 const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
-const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
-const EMBEDDING_DIM = 384;
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "openai/text-embedding-3-small";
+const EMBEDDING_DIM = 1536; // Dimensions for text-embedding-3-small
 const LLM_MODEL = process.env.MODEL_NAME || 'nvidia/nemotron-3-super-120b-a12b:free';
 
 const qdrant = new QdrantClient({
   url: QDRANT_URL,
-  apiKey: process.env.QDRANT_API_KEY, // Added for Qdrant Cloud support
+  apiKey: process.env.QDRANT_API_KEY,
 });
 
 const openai = new OpenAI({
@@ -40,93 +33,120 @@ const openai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
 });
 
-// ── Embedding (Local — no API key needed) ──────────────────────────────────────
-
-let embedder = null;
+// ── Remote Embedding ───────────────────────────────────────────────────────────
 
 /**
- * Lazily initialize and return the local embedding pipeline.
- * First call downloads the model (~80 MB); subsequent calls reuse it.
+ * Embed text using a remote API.
+ * This is significantly faster for large documents than local processing.
  */
-async function getEmbedder() {
-  if (!embedder) {
-    embedder = await pipeline("feature-extraction", EMBEDDING_MODEL);
-  }
-  return embedder;
-}
-
-/** Embed a single string and return a flat Float32 array. */
 async function embedText(text) {
-  const extractor = await getEmbedder();
-  const output = await extractor(text, { pooling: "mean", normalize: true });
-  return Array.from(output.data);
+  const response = await openai.embeddings.create({
+    model: EMBEDDING_MODEL,
+    input: text,
+  });
+  return response.data[0].embedding;
 }
 
 /**
- * Embed an array of strings in controlled sub-batches.
- * This prevents memory exhaustion and event loop blocking for large documents.
+ * Embed multiple strings in a single batch call.
+ * This is the "secret sauce" for 300+ page PDFs.
  */
 async function embedBatch(texts, onProgress) {
-  const extractor = await getEmbedder();
-  const SUB_BATCH_SIZE = 32; // Balanced for CPU/Memory usage
+  const BATCH_SIZE = 100; // Large batches are fine for remote APIs
   const embeddings = [];
 
   if (onProgress) onProgress(0, texts.length);
 
-  for (let i = 0; i < texts.length; i += SUB_BATCH_SIZE) {
-    const subBatch = texts.slice(i, i + SUB_BATCH_SIZE);
+  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+    const subBatch = texts.slice(i, i + BATCH_SIZE);
     
-    // Process sub-batch
-    const output = await extractor(subBatch, { pooling: "mean", normalize: true });
+    const response = await openai.embeddings.create({
+      model: EMBEDDING_MODEL,
+      input: subBatch,
+    });
 
-    // Extract vectors from output
-    for (let j = 0; j < subBatch.length; j++) {
-      const start = j * EMBEDDING_DIM;
-      embeddings.push(Array.from(output.data.slice(start, start + EMBEDDING_DIM)));
-    }
+    embeddings.push(...response.data.map(d => d.embedding));
 
-    if (onProgress) onProgress(Math.min(i + SUB_BATCH_SIZE, texts.length), texts.length);
-    
-    // Tiny delay to allow event loop to handle other tasks (e.g. status requests)
-    await new Promise(resolve => setTimeout(resolve, 0));
+    if (onProgress) onProgress(embeddings.length, texts.length);
   }
 
   return embeddings;
 }
 
-// ── Document Loading ───────────────────────────────────────────────────────────
+// ── Advanced Retrieval Logic ───────────────────────────────────────────────────
 
 /**
- * Load a document and return an array of { pageNumber, text } objects.
- * Supports .pdf and .txt files.
+ * Expand a user query to include more relevant keywords.
  */
+async function expandQuery(query) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "google/gemini-flash-1.5-8b", // Fast, cheap model for expansion
+      messages: [
+        { 
+          role: "system", 
+          content: "Expand the user's question into a more descriptive search query that will help find relevant information in a document. Return ONLY the expanded query text." 
+        },
+        { role: "user", content: query }
+      ],
+      temperature: 0.1,
+    });
+    return response.choices[0].message.content.trim();
+  } catch (e) {
+    console.error("Query expansion failed:", e);
+    return query; // Fallback to original
+  }
+}
+
+/**
+ * Simple Cosine Similarity for Reranking
+ */
+function cosineSimilarity(vecA, vecB) {
+  let dotProduct = 0;
+  let mA = 0;
+  let mB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    mA += vecA[i] * vecA[i];
+    mB += vecB[i] * vecB[i];
+  }
+  return dotProduct / (Math.sqrt(mA) * Math.sqrt(mB));
+}
+
+/**
+ * Rerank retrieved chunks based on original query relevance.
+ */
+async function rerankChunks(originalQuery, retrievedChunks, topK = 5) {
+  const queryVec = await embedText(originalQuery);
+  
+  const scored = retrievedChunks.map(chunk => {
+    const score = cosineSimilarity(queryVec, chunk.vector);
+    return { ...chunk, rerankScore: score };
+  });
+
+  return scored
+    .sort((a, b) => b.rerankScore - a.rerankScore)
+    .slice(0, topK);
+}
+
+// ── Document Loading ───────────────────────────────────────────────────────────
+
 async function loadDocument(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-
   if (ext === ".pdf") return loadPDF(filePath);
   if (ext === ".txt") return loadText(filePath);
-  throw new Error(`Unsupported file type: ${ext}. Use .pdf or .txt`);
+  throw new Error(`Unsupported file type: ${ext}`);
 }
 
 async function loadPDF(filePath) {
   const buffer = fs.readFileSync(filePath);
-
-  // Use pdf-parse's standard API — the custom `pagerender` hook is
-  // undocumented, version-sensitive, and silently returns nothing in
-  // many versions of the library.
   const data = await pdf(buffer);
-
   if (!data.text || !data.text.trim()) return [];
 
-  // Split the full text into per-page chunks using the form-feed
-  // character that pdf-parse inserts between pages (when present),
-  // falling back to treating the whole document as a single page.
   const rawPages = data.text.split(/\f/);
-  const pages = rawPages
+  return rawPages
     .map((text, i) => ({ pageNumber: i + 1, text: text.replace(/\s+/g, " ").trim() }))
     .filter((p) => p.text.length > 0);
-
-  return pages.length > 0 ? pages : [{ pageNumber: 1, text: data.text.trim() }];
 }
 
 async function loadText(filePath) {
@@ -135,23 +155,6 @@ async function loadText(filePath) {
 }
 
 // ── Chunking ───────────────────────────────────────────────────────────────────
-//
-//  Strategy: Recursive Character Text Splitting
-//
-//  How it works:
-//    1. Try to split by the largest separator first (\n\n → \n → ". " → " " → "")
-//    2. Merge parts until chunkSize is exceeded, then start a new chunk
-//    3. Keep chunkOverlap characters from the end of the previous chunk for continuity
-//    4. If any chunk is still too large, recursively split with the next separator
-//
-//  Why this strategy:
-//    - Respects natural paragraph boundaries (unlike naive fixed-size splitting)
-//    - Overlap prevents losing context at chunk edges
-//    - Recursive fallback ensures no chunk exceeds the size limit
-//
-//  Parameters:
-//    chunkSize   = 1000 chars — balances granularity vs context
-//    chunkOverlap =  200 chars — keeps boundary sentences intact
 
 class RecursiveCharacterTextSplitter {
   constructor({ chunkSize = 1000, chunkOverlap = 200 } = {}) {
@@ -160,36 +163,24 @@ class RecursiveCharacterTextSplitter {
     this.separators = ["\n\n", "\n", ". ", " ", ""];
   }
 
-  /** Split pages into chunks with metadata. */
   splitDocuments(pages) {
     const allChunks = [];
     let globalIndex = 0;
-
     for (const page of pages) {
       const textChunks = this.splitText(page.text);
       for (const text of textChunks) {
-        allChunks.push({
-          text,
-          metadata: {
-            pageNumber: page.pageNumber,
-            chunkIndex: globalIndex++,
-          },
-        });
+        allChunks.push({ text, metadata: { pageNumber: page.pageNumber, chunkIndex: globalIndex++ } });
       }
     }
-
     return allChunks;
   }
 
-  /** Split a single string into chunks. */
   splitText(text) {
     return this._split(text, this.separators);
   }
 
   _split(text, separators) {
     if (!text || text.length <= this.chunkSize) return text ? [text] : [];
-
-    // Find the first separator that exists in the text
     const sep = separators.find((s) => s === "" || text.includes(s));
     if (sep === undefined) return [text];
 
@@ -199,22 +190,16 @@ class RecursiveCharacterTextSplitter {
 
     for (const part of parts) {
       const combined = current ? current + sep + part : part;
-
       if (combined.length > this.chunkSize && current) {
         chunks.push(current.trim());
-        // Carry over the tail for overlap
-        const overlap = current.slice(
-          Math.max(0, current.length - this.chunkOverlap)
-        );
+        const overlap = current.slice(Math.max(0, current.length - this.chunkOverlap));
         current = overlap ? overlap + sep + part : part;
       } else {
         current = combined;
       }
     }
-
     if (current.trim()) chunks.push(current.trim());
 
-    // Recursively split any chunks that are still too large
     const nextSeps = separators.slice(separators.indexOf(sep) + 1);
     if (nextSeps.length > 0) {
       const result = [];
@@ -227,51 +212,33 @@ class RecursiveCharacterTextSplitter {
       }
       return result;
     }
-
     return chunks;
   }
 }
 
 // ── Indexing (Ingestion Pipeline) ──────────────────────────────────────────────
 
-/**
- * Full ingestion: load → chunk → embed → store in Qdrant.
- * Returns { collectionName, fileName, totalChunks, totalPages }.
- */
 async function indexDocument(filePath, fileName, onProgress) {
   const collectionName = `doc_${Date.now()}`;
 
-  // 1 — Load
   if (onProgress) onProgress("loading", "Loading document…");
   const pages = await loadDocument(filePath);
-  if (!pages.length) throw new Error("No text content found in the document");
-
-  // 2 — Chunk
+  
   if (onProgress) onProgress("chunking", "Chunking document…");
-  const splitter = new RecursiveCharacterTextSplitter({
-    chunkSize: 1000,
-    chunkOverlap: 200,
-  });
+  const splitter = new RecursiveCharacterTextSplitter();
   const chunks = splitter.splitDocuments(pages);
-  if (!chunks.length) throw new Error("No chunks generated from document");
 
-  // 3 — Embed
-  if (onProgress)
-    onProgress("embedding", `Embedding ${chunks.length} chunks…`);
+  if (onProgress) onProgress("embedding", `Embedding ${chunks.length} chunks remotely…`);
   const embeddings = await embedBatch(
     chunks.map((c) => c.text),
-    (done, total) => {
-      if (onProgress) onProgress("embedding", `Embedding ${done}/${total}`);
-    }
+    (done, total) => { if (onProgress) onProgress("embedding", `Embedded ${done}/${total}`); }
   );
 
-  // 4 — Create Qdrant collection
-  if (onProgress) onProgress("storing", "Storing vectors in Qdrant…");
+  if (onProgress) onProgress("storing", "Storing in Qdrant…");
   await qdrant.createCollection(collectionName, {
     vectors: { size: EMBEDDING_DIM, distance: "Cosine" },
   });
 
-  // 5 — Upsert in batches of 100
   const BATCH = 100;
   for (let i = 0; i < chunks.length; i += BATCH) {
     const slice = chunks.slice(i, i + BATCH);
@@ -291,61 +258,50 @@ async function indexDocument(filePath, fileName, onProgress) {
     });
   }
 
-  if (onProgress) onProgress("done", "Document indexed successfully!");
-
-  return {
-    collectionName,
-    fileName,
-    totalChunks: chunks.length,
-    totalPages: pages.length,
-  };
+  return { collectionName, fileName, totalChunks: chunks.length, totalPages: pages.length };
 }
 
 // ── Retrieval + Generation ─────────────────────────────────────────────────────
 
-/**
- * Answer a user question grounded in the given Qdrant collection.
- * Returns { answer, sources }.
- */
 async function chat(question, collectionName) {
-  // 1 — Embed the question
-  const queryVector = await embedText(question);
+  // 1 — Expand Query for better coverage
+  const expandedQuery = await expandQuery(question);
 
-  // 2 — Retrieve top-3 similar chunks
+  // 2 — Retrieve more candidates for reranking
+  const queryVector = await embedText(expandedQuery);
   const results = await qdrant.search(collectionName, {
     vector: queryVector,
-    limit: 3,
+    limit: 15, // Retrieve more for reranking
     with_payload: true,
+    with_vector: true,
   });
 
-  const contextChunks = results.map((r) => ({
+  // 3 — Rerank based on original question
+  const reranked = await rerankChunks(question, results.map(r => ({
     text: r.payload.text,
     pageNumber: r.payload.pageNumber,
-    score: r.score,
-  }));
+    vector: r.vector,
+    score: r.score
+  })), 5);
 
-  // 3 — Build context string
-  const contextStr = contextChunks
-    .map(
-      (c, i) =>
-        `[Chunk ${i + 1} | Page ${c.pageNumber} | Relevance: ${(c.score * 100).toFixed(1)}%]\n${c.text}`
-    )
+  const contextStr = reranked
+    .map((c, i) => `[Chunk ${i + 1} | Page ${c.pageNumber}]\n${c.text}`)
     .join("\n\n---\n\n");
 
-  // 4 — Call LLM with grounding prompt
-  const systemPrompt = `You are a document Q&A assistant. Answer ONLY based on the provided context chunks from the uploaded document.
+  const systemPrompt = `You are an intelligent AI research assistant. Your job is to help users understand and analyze the documents they have uploaded.
 
-Rules:
-1. If the answer is found in the context, provide it with specific details.
-2. If the answer is NOT in the context, say "I couldn't find this information in the uploaded document."
-3. NEVER use your general knowledge — only the document content.
-4. Always cite the page number(s) where you found the information, like [Page X].
-5. If the context is ambiguous, say so and quote the relevant passages.
-6. Keep answers concise but thorough.
-7. Use markdown formatting for better readability.
+## Context Information:
+Below are snippets (chunks) retrieved from the uploaded documents.
 
-Context from document:
-${contextStr}`;
+${contextStr}
+
+## Instructions:
+1. **Core Rule:** Base your response **exclusively** on the provided context.
+2. **Summary Requests:** If the user asks for a summary, synthesize what IS there while explaining that these represent the most relevant parts found.
+3. **No Information:** If the context is truly irrelevant, say "I couldn't find sufficient information in the uploaded documents."
+4. **Citations:** Always cite the page number(s) where you found the information, like [Page X].
+5. **Formatting:** Use clear Markdown.
+6. **Tone:** Professional and analytical.`;
 
   const response = await openai.chat.completions.create({
     model: LLM_MODEL,
@@ -353,21 +309,18 @@ ${contextStr}`;
       { role: "system", content: systemPrompt },
       { role: "user", content: question },
     ],
-    temperature: 0.3,
-    max_tokens: 2048,
+    temperature: 0.2,
   });
 
   return {
     answer: response.choices[0].message.content,
-    sources: contextChunks.map((c) => ({
+    sources: reranked.map((c) => ({
       pageNumber: c.pageNumber,
-      preview: c.text.slice(0, 150) + (c.text.length > 150 ? "…" : ""),
-      relevance: c.score,
+      preview: c.text.slice(0, 150) + "...",
+      relevance: c.rerankScore,
     })),
   };
 }
-
-// ── Collection Management ──────────────────────────────────────────────────────
 
 async function listCollections() {
   const res = await qdrant.getCollections();
@@ -378,12 +331,4 @@ async function deleteCollection(name) {
   await qdrant.deleteCollection(name);
 }
 
-// ── Exports ────────────────────────────────────────────────────────────────────
-
-export {
-  indexDocument,
-  chat,
-  listCollections,
-  deleteCollection,
-  getEmbedder,
-};
+export { indexDocument, chat, listCollections, deleteCollection };

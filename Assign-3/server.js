@@ -20,7 +20,6 @@ import {
   chat,
   listCollections,
   deleteCollection,
-  getEmbedder,
 } from "./rag.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -222,16 +221,5 @@ app.use((err, req, res, next) => {
 app.listen(PORT, async () => {
   console.log(`\n🚀  NotebookLM RAG Server → http://localhost:${PORT}`);
   console.log(`📄  Upload documents and start chatting!\n`);
-
-  console.log("⏳  Verifying embedding model…");
-  try {
-    await getEmbedder();
-    console.log("✅  Embedding model ready!\n");
-  } catch (err) {
-    // Exit immediately so Railway/the process manager restarts with a clear error.
-    // A server running without the embedding model will OOM or fail mid-request,
-    // producing misleading errors like "question and collectionName are required".
-    console.error("❌  Embedding model failed to load — shutting down:", err.message);
-    process.exit(1);
-  }
+  console.log(`✅  Ready for large documents with Remote Embeddings!\n`);
 });
