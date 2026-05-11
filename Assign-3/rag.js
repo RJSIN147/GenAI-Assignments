@@ -20,7 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nvidia/llama-nemotron-embed-vl-1b-v2:free";
-const EMBEDDING_DIM = 1024; // Dimensions for the NVIDIA free embedding model
+const EMBEDDING_DIM = 2048; // Correct dimensions for NVIDIA multimodal embedder
 const LLM_MODEL = process.env.MODEL_NAME || 'nvidia/nemotron-3-super-120b-a12b:free';
 
 const qdrant = new QdrantClient({
@@ -41,44 +41,46 @@ const openai = new OpenAI({
 
 /**
  * Embed text using a remote API.
- * This is significantly faster for large documents than local processing.
  */
-async function embedText(text) {
+async function embedText(text, type = "search_query") {
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
     input: text,
+    extra_body: { input_type: type } // Required for some NVIDIA models
   });
+
+  if (!response.data || !response.data[0]) {
+    throw new Error(`Embedding failed: ${JSON.stringify(response)}`);
+  }
   return response.data[0].embedding;
 }
 
 /**
- * Embed multiple strings in a single batch call.
- * This is the "secret sauce" for 300+ page PDFs.
+ * Embed multiple strings.
+ * Reduced batch size to 1 to handle free model rate limits and response stability.
  */
 async function embedBatch(texts, onProgress) {
-  const BATCH_SIZE = 100; // Large batches are fine for remote APIs
   const embeddings = [];
 
   if (onProgress) onProgress(0, texts.length);
 
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const subBatch = texts.slice(i, i + BATCH_SIZE);
+  for (let i = 0; i < texts.length; i++) {
+    const text = texts[i];
     
     try {
-      const response = await openai.embeddings.create({
-        model: EMBEDDING_MODEL,
-        input: subBatch,
-      });
-
-      embeddings.push(...response.data.map(d => d.embedding));
+      const vec = await embedText(text, "search_document");
+      embeddings.push(vec);
     } catch (e) {
-      console.error("Batch embedding failed:", e);
+      console.error(`Batch embedding failed at index ${i}:`, e);
       throw e;
     }
 
-    if (onProgress) onProgress(embeddings.length, texts.length);
+    if (onProgress && (i + 1) % 5 === 0) {
+      onProgress(i + 1, texts.length);
+    }
   }
 
+  if (onProgress) onProgress(texts.length, texts.length);
   return embeddings;
 }
 
