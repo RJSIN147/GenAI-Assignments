@@ -63,27 +63,34 @@ async function embedText(text) {
 }
 
 /**
- * Embed an array of strings in a single batched forward pass.
- * This is significantly faster than looping one-by-one because
- * the ONNX runtime processes all texts together in one call.
+ * Embed an array of strings in controlled sub-batches.
+ * This prevents memory exhaustion and event loop blocking for large documents.
  */
 async function embedBatch(texts, onProgress) {
   const extractor = await getEmbedder();
+  const SUB_BATCH_SIZE = 32; // Balanced for CPU/Memory usage
+  const embeddings = [];
 
   if (onProgress) onProgress(0, texts.length);
 
-  // Pass the entire array at once — Xenova batches internally.
-  const output = await extractor(texts, { pooling: "mean", normalize: true });
+  for (let i = 0; i < texts.length; i += SUB_BATCH_SIZE) {
+    const subBatch = texts.slice(i, i + SUB_BATCH_SIZE);
+    
+    // Process sub-batch
+    const output = await extractor(subBatch, { pooling: "mean", normalize: true });
 
-  // output.data is a flat Float32Array of shape [N × EMBEDDING_DIM].
-  // Slice it into per-text arrays.
-  const embeddings = [];
-  for (let i = 0; i < texts.length; i++) {
-    const start = i * EMBEDDING_DIM;
-    embeddings.push(Array.from(output.data.slice(start, start + EMBEDDING_DIM)));
+    // Extract vectors from output
+    for (let j = 0; j < subBatch.length; j++) {
+      const start = j * EMBEDDING_DIM;
+      embeddings.push(Array.from(output.data.slice(start, start + EMBEDDING_DIM)));
+    }
+
+    if (onProgress) onProgress(Math.min(i + SUB_BATCH_SIZE, texts.length), texts.length);
+    
+    // Tiny delay to allow event loop to handle other tasks (e.g. status requests)
+    await new Promise(resolve => setTimeout(resolve, 0));
   }
 
-  if (onProgress) onProgress(texts.length, texts.length);
   return embeddings;
 }
 

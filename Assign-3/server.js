@@ -2,7 +2,8 @@
  * server.js — Express backend for the NotebookLM RAG application.
  *
  * Routes:
- *   POST   /api/upload          Upload & index a document
+ *   POST   /api/upload          Upload & index a document (Async)
+ *   GET    /api/status/:jobId   Check indexing status
  *   POST   /api/chat            Ask a question against a collection
  *   GET    /api/collections     List indexed documents
  *   DELETE /api/collection/:name Delete a collection
@@ -51,6 +52,10 @@ function saveCollections() {
   fs.writeFileSync(collectionsFile, JSON.stringify(collectionsMap, null, 2));
 }
 
+// ── In-memory Job Tracking ─────────────────────────────────────────────────────
+
+const jobs = new Map();
+
 // ── Middleware ─────────────────────────────────────────────────────────────────
 
 app.use(express.json());
@@ -65,7 +70,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     if ([".pdf", ".txt"].includes(ext)) return cb(null, true);
@@ -75,34 +80,90 @@ const upload = multer({
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Upload & index a document
+// Upload & index a document (Asynchronous)
 app.post("/api/upload", upload.single("document"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const onProgress = (stage, message) => {
-      console.log(`  [${stage.toUpperCase()}] ${message}`);
-    };
+    const jobId = `job_${Date.now()}`;
+    const filePath = req.file.path;
+    const fileName = req.file.originalname;
 
-    const result = await indexDocument(req.file.path, req.file.originalname, onProgress);
+    // Initialize job status
+    jobs.set(jobId, {
+      id: jobId,
+      status: "pending",
+      stage: "loading",
+      message: "Starting indexing...",
+      progress: 0,
+      total: 0,
+    });
 
-    // Persist metadata
-    collectionsMap[result.collectionName] = {
-      fileName: result.fileName,
-      totalChunks: result.totalChunks,
-      totalPages: result.totalPages,
-      uploadedAt: new Date().toISOString(),
-    };
-    saveCollections();
+    // Start indexing in the background (DO NOT AWAIT)
+    (async () => {
+      try {
+        const onProgress = (stage, message) => {
+          const job = jobs.get(jobId);
+          if (job) {
+            job.stage = stage;
+            job.message = message;
+            
+            // Try to extract progress if message contains it (e.g. "Embedding 10/100")
+            const progressMatch = message.match(/(\d+)\/(\d+)/);
+            if (progressMatch) {
+              job.progress = parseInt(progressMatch[1], 10);
+              job.total = parseInt(progressMatch[2], 10);
+            }
+          }
+          console.log(`  [${jobId}] [${stage.toUpperCase()}] ${message}`);
+        };
 
-    // Clean up temp file
-    try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+        const result = await indexDocument(filePath, fileName, onProgress);
 
-    res.json({ success: true, ...result, message: "Document indexed successfully" });
+        // Update collections metadata
+        collectionsMap[result.collectionName] = {
+          fileName: result.fileName,
+          totalChunks: result.totalChunks,
+          totalPages: result.totalPages,
+          uploadedAt: new Date().toISOString(),
+        };
+        saveCollections();
+
+        // Mark job as done
+        jobs.set(jobId, {
+          ...jobs.get(jobId),
+          status: "completed",
+          result: {
+            collectionName: result.collectionName,
+            fileName: result.fileName,
+            totalChunks: result.totalChunks,
+            totalPages: result.totalPages,
+          },
+        });
+
+      } catch (err) {
+        console.error(`Indexing error for ${jobId}:`, err);
+        jobs.set(jobId, { ...jobs.get(jobId), status: "failed", error: err.message });
+      } finally {
+        // Clean up temp file
+        try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { /* ignore */ }
+      }
+    })();
+
+    // Respond immediately with the jobId
+    res.json({ success: true, jobId, message: "Indexing started in background" });
+
   } catch (err) {
-    console.error("Upload error:", err);
+    console.error("Upload route error:", err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Check indexing status
+app.get("/api/status/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  res.json(job);
 });
 
 // Chat with a document
@@ -150,10 +211,6 @@ app.delete("/api/collection/:name", async (req, res) => {
 });
 
 // ── Multer error handler ──────────────────────────────────────────────────────
-// Must be defined AFTER routes with 4 arguments (err, req, res, next).
-// Without this, multer errors (file size, wrong type, disk write) are swallowed
-// by Express's default HTML error handler and the client gets no JSON back.
-// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("Express error:", err);
   const status = err.status || err.statusCode || 500;

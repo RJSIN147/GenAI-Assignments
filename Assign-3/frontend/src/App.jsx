@@ -21,6 +21,7 @@ function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState({ stage: '', message: '', progress: 0, total: 0 });
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [chatHistories, setChatHistories] = useState({});
@@ -63,9 +64,48 @@ function App() {
     setMessages(chatHistories[col.name] || []);
   };
 
+  const pollStatus = async (jobId) => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/status/${jobId}`);
+        const data = await res.json();
+
+        if (data.status === 'completed') {
+          clearInterval(interval);
+          setIsUploading(false);
+          await loadCollections();
+          setShowUploadModal(false);
+          
+          const newCol = {
+            name: data.result.collectionName,
+            fileName: data.result.fileName,
+            totalChunks: data.result.totalChunks,
+            totalPages: data.result.totalPages
+          };
+          selectCollection(newCol);
+        } else if (data.status === 'failed') {
+          clearInterval(interval);
+          setIsUploading(false);
+          alert(`Indexing failed: ${data.error}`);
+        } else {
+          setUploadStatus({
+            stage: data.stage,
+            message: data.message,
+            progress: data.progress,
+            total: data.total
+          });
+        }
+      } catch (err) {
+        console.error('Status polling error:', err);
+      }
+    }, 1500);
+  };
+
   const handleUpload = async (file) => {
     if (!file) return;
     setIsUploading(true);
+    setUploadStatus({ stage: 'uploading', message: 'Uploading file to server...', progress: 0, total: 0 });
+    
     const formData = new FormData();
     formData.append('document', file);
 
@@ -74,20 +114,10 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Upload failed');
 
-      await loadCollections();
-      setShowUploadModal(false);
-
-      // Auto-select new doc
-      const newCol = {
-        name: data.collectionName,
-        fileName: data.fileName,
-        totalChunks: data.totalChunks,
-        totalPages: data.totalPages
-      };
-      selectCollection(newCol);
+      // Start polling for status
+      pollStatus(data.jobId);
     } catch (err) {
       alert(err.message);
-    } finally {
       setIsUploading(false);
     }
   };
@@ -301,7 +331,22 @@ function App() {
             {isUploading ? (
               <div style={{ textAlign: 'center', padding: '40px 0' }}>
                 <Loader2 size={32} className="animate-spin" style={{ margin: '0 auto 16px', color: 'var(--accent-color)' }} />
-                <p style={{ color: 'var(--text-secondary)' }}>Processing and indexing document...</p>
+                <p style={{ color: 'var(--text-secondary)', fontWeight: '500' }}>
+                  {uploadStatus.message || 'Processing...'}
+                </p>
+                {uploadStatus.total > 0 && (
+                  <div style={{ marginTop: '12px' }}>
+                    <div className="progress-bar-bg">
+                      <div 
+                        className="progress-bar-fill" 
+                        style={{ width: `${(uploadStatus.progress / uploadStatus.total) * 100}%` }}
+                      ></div>
+                    </div>
+                    <p style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '8px' }}>
+                      {uploadStatus.progress} / {uploadStatus.total} chunks
+                    </p>
+                  </div>
+                )}
               </div>
             ) : (
               <div
@@ -315,7 +360,7 @@ function App() {
               >
                 <Upload className="drop-zone-icon" />
                 <p style={{ fontSize: '14px', marginBottom: '8px' }}>Drag and drop files here</p>
-                <p style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>PDF or TXT up to 50MB</p>
+                <p style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>PDF or TXT up to 100MB</p>
                 <input
                   type="file"
                   ref={fileInputRef}
