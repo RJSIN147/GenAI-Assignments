@@ -2,7 +2,7 @@
  * rag.js — Advanced RAG Pipeline
  *
  * Upgraded to handle large (300+ page) PDFs by:
- *   1. Using Remote Embeddings (OpenAI/OpenRouter)
+ *   1. Using Remote Embeddings (Free NVIDIA model via OpenRouter)
  *   2. Implementing Query Expansion
  *   3. Implementing Reranking
  */
@@ -19,8 +19,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ── Configuration ──────────────────────────────────────────────────────────────
 
 const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "openai/text-embedding-3-small";
-const EMBEDDING_DIM = 1536; // Dimensions for text-embedding-3-small
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nvidia/llama-nemotron-embed-vl-1b-v2:free";
+const EMBEDDING_DIM = 1024; // Dimensions for the NVIDIA free embedding model
 const LLM_MODEL = process.env.MODEL_NAME || 'nvidia/nemotron-3-super-120b-a12b:free';
 
 const qdrant = new QdrantClient({
@@ -32,7 +32,7 @@ const openai = new OpenAI({
   baseURL: process.env.BASE_URL || "https://openrouter.ai/api/v1",
   apiKey: process.env.OPENROUTER_API_KEY,
   defaultHeaders: {
-    "HTTP-Referer": "https://github.com/google-gemini/gemini-cli", // Required for OpenRouter
+    "HTTP-Referer": "https://github.com/google-gemini/gemini-cli",
     "X-Title": "NotebookLM-Clone",
   },
 });
@@ -64,12 +64,17 @@ async function embedBatch(texts, onProgress) {
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
     const subBatch = texts.slice(i, i + BATCH_SIZE);
     
-    const response = await openai.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: subBatch,
-    });
+    try {
+      const response = await openai.embeddings.create({
+        model: EMBEDDING_MODEL,
+        input: subBatch,
+      });
 
-    embeddings.push(...response.data.map(d => d.embedding));
+      embeddings.push(...response.data.map(d => d.embedding));
+    } catch (e) {
+      console.error("Batch embedding failed:", e);
+      throw e;
+    }
 
     if (onProgress) onProgress(embeddings.length, texts.length);
   }
