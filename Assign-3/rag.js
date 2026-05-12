@@ -46,6 +46,7 @@ async function embedText(text, type = "search_query") {
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
     input: text,
+    encoding_format: "float",
     extra_body: { input_type: type } // Required for some NVIDIA models
   });
 
