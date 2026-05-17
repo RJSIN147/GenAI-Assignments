@@ -2,14 +2,90 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>NotebookLM — Research Assistant</title>
-    <meta name="description" content="A minimalist RAG application for document-based research and analysis." />
-    <script type="module" crossorigin src="/assets/index-IzdwSc9t.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-l7QzSBTI.css">
+    <meta
+      name="description"
+      content="Upload documents and chat with them using a lightweight RAG assistant."
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Mini-NotebookLM</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div class="shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar__header">
+          <div class="brand" aria-label="Mini-NotebookLM">
+            <span class="brand__mark">N</span>
+            <span class="brand__text">Mini-NotebookLM</span>
+          </div>
+          <button class="icon-button mobile-only" id="closeSidebar" aria-label="Close sidebar">
+            <span aria-hidden="true">&lt;</span>
+          </button>
+        </div>
+
+        <button class="new-chat" id="newChatButton">
+          <span aria-hidden="true">+</span>
+          <span>New Chat</span>
+        </button>
+
+        <div class="sessions" id="sessionsList" aria-label="Chats"></div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <button class="icon-button" id="openSidebar" aria-label="Open sidebar">
+            <span aria-hidden="true">=</span>
+          </button>
+          <div class="session-title">
+            <h1 id="activeSessionName">Create a new chat to begin</h1>
+            <span id="documentCount"></span>
+          </div>
+          <div class="topbar__actions">
+            <span class="upload-status" id="uploadStatus" aria-live="polite"></span>
+            <label class="upload-button" id="uploadLabel">
+              <span aria-hidden="true">^</span>
+              <span id="uploadLabelText">Upload Document</span>
+              <input
+                id="fileInput"
+                type="file"
+                accept=".pdf,.docx,.csv,.txt,.md"
+                hidden
+              />
+            </label>
+            <button class="icon-button" id="themeToggle" aria-label="Toggle theme">
+              <span aria-hidden="true" id="themeIcon">*</span>
+            </button>
+          </div>
+        </header>
+
+        <section class="empty-state" id="emptyState">
+          <div class="empty-state__mark">N</div>
+          <h2>Mini-NotebookLM</h2>
+          <p>Upload PDFs, DOCX, CSV, Markdown, or text files and ask grounded questions about them.</p>
+          <button class="primary-button" id="firstChatButton">
+            <span aria-hidden="true">+</span>
+            <span>Create Your First Chat</span>
+          </button>
+        </section>
+
+        <section class="chat" id="chatPanel" hidden>
+          <div class="messages" id="messages"></div>
+          <form class="composer" id="chatForm">
+            <input
+              id="queryInput"
+              type="text"
+              autocomplete="off"
+              placeholder="Upload a document first..."
+            />
+            <button class="send-button" id="sendButton" type="submit" aria-label="Send">
+              <span aria-hidden="true">&gt;</span>
+            </button>
+          </form>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" type="module"></script>
   </body>
 </html>

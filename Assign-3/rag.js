@@ -1,27 +1,30 @@
 /**
- * rag.js — Advanced RAG Pipeline
+ * RAG pipeline for Mini-NotebookLM.
  *
- * Upgraded to handle large (300+ page) PDFs by:
- *   1. Using Remote Embeddings (Free NVIDIA model via OpenRouter)
- *   2. Implementing Query Expansion
- *   3. Implementing Reranking
+ * The reference app uses Next.js, LangChain, and Pinecone. This version keeps
+ * the assignment stack: Express, Qdrant, OpenRouter, and a static frontend.
  */
 
 import fs from "fs";
 import path from "path";
+import { randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import pdf from "pdf-parse";
+import mammoth from "mammoth";
+import { pipeline, env } from "@xenova/transformers";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { OpenAI } from "openai";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// ── Configuration ──────────────────────────────────────────────────────────────
+env.cacheDir = path.join(__dirname, ".model-cache");
 
 const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nvidia/llama-nemotron-embed-vl-1b-v2:free";
-const EMBEDDING_DIM = 2048; // Correct dimensions for NVIDIA multimodal embedder
-const LLM_MODEL = process.env.MODEL_NAME || 'nvidia/nemotron-3-super-120b-a12b:free';
+const COLLECTION_NAME = process.env.QDRANT_COLLECTION || "mini_notebooklm_chunks";
+const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+const EMBEDDING_DIM = 384;
+const ANSWER_MODEL = process.env.MODEL_NAME || "nvidia/nemotron-3-super-120b-a12b:free";
+const UTILITY_MODEL = process.env.UTILITY_MODEL || "minimax/minimax-m2.5";
+const OPENAI_BASE_URL = process.env.BASE_URL || "https://openrouter.ai/api/v1";
 
 const qdrant = new QdrantClient({
   url: QDRANT_URL,
@@ -29,318 +32,471 @@ const qdrant = new QdrantClient({
 });
 
 const openai = new OpenAI({
-  baseURL: process.env.BASE_URL || "https://openrouter.ai/api/v1",
-  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: OPENAI_BASE_URL,
+  apiKey: process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY,
   defaultHeaders: {
-    "HTTP-Referer": "https://github.com/google-gemini/gemini-cli",
-    "X-Title": "NotebookLM-Clone",
+    "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
+    "X-Title": "Mini-NotebookLM",
   },
 });
 
-// ── Remote Embedding ───────────────────────────────────────────────────────────
+let embedder = null;
+let collectionReady = false;
 
-/**
- * Embed text using a remote API.
- */
-async function embedText(text, type = "search_query") {
-  const response = await openai.embeddings.create({
-    model: EMBEDDING_MODEL,
-    input: text,
-    encoding_format: "float",
-    extra_body: { input_type: type } // Required for some NVIDIA models
-  });
-
-  if (!response.data || !response.data[0]) {
-    throw new Error(`Embedding failed: ${JSON.stringify(response)}`);
+async function getEmbedder() {
+  if (!embedder) {
+    embedder = await pipeline("feature-extraction", EMBEDDING_MODEL);
   }
-  return response.data[0].embedding;
+  return embedder;
 }
 
-/**
- * Embed multiple strings.
- * Reduced batch size to 1 to handle free model rate limits and response stability.
- */
+async function embedText(text) {
+  const extractor = await getEmbedder();
+  const output = await extractor(text, { pooling: "mean", normalize: true });
+  return Array.from(output.data);
+}
+
 async function embedBatch(texts, onProgress) {
+  const extractor = await getEmbedder();
   const embeddings = [];
+  const batchSize = 32;
 
-  if (onProgress) onProgress(0, texts.length);
+  for (let i = 0; i < texts.length; i += batchSize) {
+    const batch = texts.slice(i, i + batchSize);
+    const output = await extractor(batch, { pooling: "mean", normalize: true });
 
-  for (let i = 0; i < texts.length; i++) {
-    const text = texts[i];
-    
-    try {
-      const vec = await embedText(text, "search_document");
-      embeddings.push(vec);
-    } catch (e) {
-      console.error(`Batch embedding failed at index ${i}:`, e);
-      throw e;
+    for (let j = 0; j < batch.length; j += 1) {
+      const start = j * EMBEDDING_DIM;
+      embeddings.push(Array.from(output.data.slice(start, start + EMBEDDING_DIM)));
     }
 
-    if (onProgress && (i + 1) % 5 === 0) {
-      onProgress(i + 1, texts.length);
-    }
+    onProgress?.(Math.min(i + batchSize, texts.length), texts.length);
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
-  if (onProgress) onProgress(texts.length, texts.length);
   return embeddings;
 }
 
-// ── Advanced Retrieval Logic ───────────────────────────────────────────────────
+async function ensureCollection() {
+  if (collectionReady) return;
 
-/**
- * Expand a user query to include more relevant keywords.
- */
-async function expandQuery(query) {
-  try {
-    const response = await openai.chat.completions.create({
-      model: "google/gemini-flash-1.5-8b", // Fast, cheap model for expansion
-      messages: [
-        { 
-          role: "system", 
-          content: "Expand the user's question into a more descriptive search query that will help find relevant information in a document. Return ONLY the expanded query text." 
-        },
-        { role: "user", content: query }
-      ],
-      temperature: 0.1,
+  const existsResult = await qdrant.collectionExists(COLLECTION_NAME).catch(() => ({ exists: false }));
+  const exists = typeof existsResult === "boolean" ? existsResult : Boolean(existsResult.exists);
+  if (!exists) {
+    await qdrant.createCollection(COLLECTION_NAME, {
+      vectors: { size: EMBEDDING_DIM, distance: "Cosine" },
     });
-    return response.choices[0].message.content.trim();
-  } catch (e) {
-    console.error("Query expansion failed:", e);
-    return query; // Fallback to original
   }
+
+  await qdrant
+    .createPayloadIndex(COLLECTION_NAME, {
+      wait: true,
+      field_name: "sessionId",
+      field_schema: "keyword",
+    })
+    .catch((error) => {
+      const message = String(error?.message || error?.data?.status?.error || "");
+      if (!message.toLowerCase().includes("already exists")) {
+        console.warn(`Could not create sessionId payload index: ${message}`);
+      }
+    });
+
+  collectionReady = true;
 }
 
-/**
- * Simple Cosine Similarity for Reranking
- */
-function cosineSimilarity(vecA, vecB) {
-  let dotProduct = 0;
-  let mA = 0;
-  let mB = 0;
-  for (let i = 0; i < vecA.length; i++) {
-    dotProduct += vecA[i] * vecB[i];
-    mA += vecA[i] * vecA[i];
-    mB += vecB[i] * vecB[i];
+function sessionFilter(sessionId) {
+  return {
+    must: [
+      {
+        key: "sessionId",
+        match: { value: sessionId },
+      },
+    ],
+  };
+}
+
+async function extractTextFromFile(filePath, originalName) {
+  const ext = path.extname(originalName || filePath).toLowerCase();
+
+  if (ext === ".pdf") {
+    const buffer = fs.readFileSync(filePath);
+    const data = await pdf(buffer);
+    return cleanText(data.text || "");
   }
-  return dotProduct / (Math.sqrt(mA) * Math.sqrt(mB));
+
+  if (ext === ".docx") {
+    const result = await mammoth.extractRawText({ path: filePath });
+    return cleanText(result.value || "");
+  }
+
+  if (ext === ".txt" || ext === ".csv" || ext === ".md") {
+    return cleanText(fs.readFileSync(filePath, "utf-8"));
+  }
+
+  throw new Error("Unsupported file type. Use PDF, DOCX, CSV, TXT, or MD.");
 }
 
-/**
- * Rerank retrieved chunks based on original query relevance.
- */
-async function rerankChunks(originalQuery, retrievedChunks, topK = 5) {
-  const queryVec = await embedText(originalQuery);
-  
-  const scored = retrievedChunks.map(chunk => {
-    const score = cosineSimilarity(queryVec, chunk.vector);
-    return { ...chunk, rerankScore: score };
-  });
-
-  return scored
-    .sort((a, b) => b.rerankScore - a.rerankScore)
-    .slice(0, topK);
+function cleanText(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
-
-// ── Document Loading ───────────────────────────────────────────────────────────
-
-async function loadDocument(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".pdf") return loadPDF(filePath);
-  if (ext === ".txt") return loadText(filePath);
-  throw new Error(`Unsupported file type: ${ext}`);
-}
-
-async function loadPDF(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const data = await pdf(buffer);
-  if (!data.text || !data.text.trim()) return [];
-
-  const rawPages = data.text.split(/\f/);
-  return rawPages
-    .map((text, i) => ({ pageNumber: i + 1, text: text.replace(/\s+/g, " ").trim() }))
-    .filter((p) => p.text.length > 0);
-}
-
-async function loadText(filePath) {
-  const text = fs.readFileSync(filePath, "utf-8");
-  return [{ pageNumber: 1, text }];
-}
-
-// ── Chunking ───────────────────────────────────────────────────────────────────
 
 class RecursiveCharacterTextSplitter {
-  constructor({ chunkSize = 1000, chunkOverlap = 200 } = {}) {
+  constructor({ chunkSize = 1000, chunkOverlap = 100 } = {}) {
     this.chunkSize = chunkSize;
     this.chunkOverlap = chunkOverlap;
     this.separators = ["\n\n", "\n", ". ", " ", ""];
   }
 
-  splitDocuments(pages) {
-    const allChunks = [];
-    let globalIndex = 0;
-    for (const page of pages) {
-      const textChunks = this.splitText(page.text);
-      for (const text of textChunks) {
-        allChunks.push({ text, metadata: { pageNumber: page.pageNumber, chunkIndex: globalIndex++ } });
-      }
-    }
-    return allChunks;
-  }
-
   splitText(text) {
-    return this._split(text, this.separators);
+    return this.split(text, this.separators).filter(Boolean);
   }
 
-  _split(text, separators) {
-    if (!text || text.length <= this.chunkSize) return text ? [text] : [];
-    const sep = separators.find((s) => s === "" || text.includes(s));
-    if (sep === undefined) return [text];
+  split(text, separators) {
+    if (!text || text.length <= this.chunkSize) return text ? [text.trim()] : [];
 
-    const parts = sep === "" ? [...text] : text.split(sep);
+    const separator = separators.find((item) => item === "" || text.includes(item));
+    if (separator === undefined) return [text.trim()];
+
+    const parts = separator === "" ? [...text] : text.split(separator);
     const chunks = [];
     let current = "";
 
     for (const part of parts) {
-      const combined = current ? current + sep + part : part;
+      const combined = current ? `${current}${separator}${part}` : part;
+
       if (combined.length > this.chunkSize && current) {
         chunks.push(current.trim());
         const overlap = current.slice(Math.max(0, current.length - this.chunkOverlap));
-        current = overlap ? overlap + sep + part : part;
+        current = overlap ? `${overlap}${separator}${part}` : part;
       } else {
         current = combined;
       }
     }
+
     if (current.trim()) chunks.push(current.trim());
 
-    const nextSeps = separators.slice(separators.indexOf(sep) + 1);
-    if (nextSeps.length > 0) {
-      const result = [];
-      for (const chunk of chunks) {
-        if (chunk.length > this.chunkSize) {
-          result.push(...this._split(chunk, nextSeps));
-        } else {
-          result.push(chunk);
-        }
-      }
-      return result;
-    }
-    return chunks;
+    const nextSeparators = separators.slice(separators.indexOf(separator) + 1);
+    if (!nextSeparators.length) return chunks;
+
+    return chunks.flatMap((chunk) =>
+      chunk.length > this.chunkSize ? this.split(chunk, nextSeparators) : [chunk]
+    );
   }
 }
 
-// ── Indexing (Ingestion Pipeline) ──────────────────────────────────────────────
+async function indexDocumentText({ text, fileName, sessionId, onProgress }) {
+  if (!sessionId) throw new Error("sessionId is required");
+  const normalizedText = cleanText(text);
+  if (!normalizedText) throw new Error("No text content found in the document");
 
-async function indexDocument(filePath, fileName, onProgress) {
-  const collectionName = `doc_${Date.now()}`;
+  await ensureCollection();
 
-  if (onProgress) onProgress("loading", "Loading document…");
-  const pages = await loadDocument(filePath);
-  
-  if (onProgress) onProgress("chunking", "Chunking document…");
-  const splitter = new RecursiveCharacterTextSplitter();
-  const chunks = splitter.splitDocuments(pages);
+  onProgress?.("chunking", "Splitting document into chunks");
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 100,
+  });
+  const chunks = splitter.splitText(normalizedText);
+  if (!chunks.length) throw new Error("No chunks generated from document");
 
-  if (onProgress) onProgress("embedding", `Embedding ${chunks.length} chunks remotely…`);
-  const embeddings = await embedBatch(
-    chunks.map((c) => c.text),
-    (done, total) => { if (onProgress) onProgress("embedding", `Embedded ${done}/${total}`); }
-  );
-
-  if (onProgress) onProgress("storing", "Storing in Qdrant…");
-  await qdrant.createCollection(collectionName, {
-    vectors: { size: EMBEDDING_DIM, distance: "Cosine" },
+  onProgress?.("embedding", `Embedding 0/${chunks.length}`);
+  const embeddings = await embedBatch(chunks, (done, total) => {
+    onProgress?.("embedding", `Embedding ${done}/${total}`);
   });
 
-  const BATCH = 100;
-  for (let i = 0; i < chunks.length; i += BATCH) {
-    const slice = chunks.slice(i, i + BATCH);
-    const vecs = embeddings.slice(i, i + BATCH);
+  onProgress?.("storing", "Storing vectors in Qdrant");
+  const uploadedAt = new Date().toISOString();
+  const points = chunks.map((chunk, index) => ({
+    id: randomUUID(),
+    vector: embeddings[index],
+    payload: {
+      text: chunk,
+      source: fileName || "Untitled document",
+      sessionId,
+      chunkIndex: index,
+      uploadedAt,
+    },
+  }));
 
-    await qdrant.upsert(collectionName, {
-      points: slice.map((chunk, j) => ({
-        id: i + j,
-        vector: vecs[j],
-        payload: {
-          text: chunk.text,
-          pageNumber: chunk.metadata.pageNumber,
-          chunkIndex: chunk.metadata.chunkIndex,
-          source: fileName,
-        },
-      })),
+  const batchSize = 100;
+  for (let i = 0; i < points.length; i += batchSize) {
+    await qdrant.upsert(COLLECTION_NAME, {
+      wait: true,
+      points: points.slice(i, i + batchSize),
     });
   }
 
-  return { collectionName, fileName, totalChunks: chunks.length, totalPages: pages.length };
-}
-
-// ── Retrieval + Generation ─────────────────────────────────────────────────────
-
-async function chat(question, collectionName) {
-  // 1 — Expand Query for better coverage
-  const expandedQuery = await expandQuery(question);
-
-  // 2 — Retrieve more candidates for reranking
-  const queryVector = await embedText(expandedQuery);
-  const results = await qdrant.search(collectionName, {
-    vector: queryVector,
-    limit: 15, // Retrieve more for reranking
-    with_payload: true,
-    with_vector: true,
-  });
-
-  // 3 — Rerank based on original question
-  const reranked = await rerankChunks(question, results.map(r => ({
-    text: r.payload.text,
-    pageNumber: r.payload.pageNumber,
-    vector: r.vector,
-    score: r.score
-  })), 5);
-
-  const contextStr = reranked
-    .map((c, i) => `[Chunk ${i + 1} | Page ${c.pageNumber}]\n${c.text}`)
-    .join("\n\n---\n\n");
-
-  const systemPrompt = `You are an intelligent AI research assistant. Your job is to help users understand and analyze the documents they have uploaded.
-
-## Context Information:
-Below are snippets (chunks) retrieved from the uploaded documents.
-
-${contextStr}
-
-## Instructions:
-1. **Core Rule:** Base your response **exclusively** on the provided context.
-2. **Summary Requests:** If the user asks for a summary, synthesize what IS there while explaining that these represent the most relevant parts found.
-3. **No Information:** If the context is truly irrelevant, say "I couldn't find sufficient information in the uploaded documents."
-4. **Citations:** Always cite the page number(s) where you found the information, like [Page X].
-5. **Formatting:** Use clear Markdown.
-6. **Tone:** Professional and analytical.`;
-
-  const response = await openai.chat.completions.create({
-    model: LLM_MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: question },
-    ],
-    temperature: 0.2,
-  });
-
   return {
-    answer: response.choices[0].message.content,
-    sources: reranked.map((c) => ({
-      pageNumber: c.pageNumber,
-      preview: c.text.slice(0, 150) + "...",
-      relevance: c.rerankScore,
-    })),
+    sessionId,
+    fileName: fileName || "Untitled document",
+    chunks: chunks.length,
+    characters: normalizedText.length,
   };
 }
 
-async function listCollections() {
-  const res = await qdrant.getCollections();
-  return res.collections;
+async function indexDocumentFile({ filePath, fileName, sessionId, onProgress }) {
+  onProgress?.("parsing", "Extracting text from document");
+  const text = await extractTextFromFile(filePath, fileName);
+  return indexDocumentText({ text, fileName, sessionId, onProgress });
 }
 
-async function deleteCollection(name) {
-  await qdrant.deleteCollection(name);
+async function expandQuery(query) {
+  return utilityCompletion({
+    fallback: query,
+    maxTokens: 180,
+    messages: [
+      { role: "system", content: "You expand user questions for semantic document retrieval. Return only the expanded query." },
+      {
+        role: "user",
+        content: `Given the user's question about uploaded documents, expand it with relevant keywords and context that would help find the most relevant information.\n\nUser question: ${query}\n\nExpanded query:`,
+      },
+    ],
+  });
 }
 
-export { indexDocument, chat, listCollections, deleteCollection };
+async function reformulateQuery(query) {
+  return utilityCompletion({
+    fallback: query,
+    maxTokens: 120,
+    messages: [
+      { role: "system", content: "You reformulate user queries for document retrieval. Keep the original meaning intact." },
+      {
+        role: "user",
+        content: `The user asked: "${query}"\n\nInitial retrieval was weak. Rephrase the query to better match wording that might exist in uploaded PDF, DOCX, CSV, TXT, or Markdown documents. Return only the rephrased query.`,
+      },
+    ],
+  });
+}
+
+async function utilityCompletion({ messages, fallback, maxTokens }) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: UTILITY_MODEL,
+      messages,
+      temperature: 0.2,
+      max_tokens: maxTokens,
+    });
+
+    return response.choices[0]?.message?.content?.trim() || fallback;
+  } catch (error) {
+    console.error("Utility model call failed:", error.message);
+    return fallback;
+  }
+}
+
+async function retrieveAndRerank(query, sessionId, topK = 15) {
+  await ensureCollection();
+
+  const queryVector = await embedText(query);
+  const results = await qdrant.search(COLLECTION_NAME, {
+    vector: queryVector,
+    limit: topK,
+    with_payload: true,
+    with_vector: true,
+    filter: sessionFilter(sessionId),
+  });
+
+  if (!results.length) {
+    return { chunks: [], scores: [], maxScore: 0, avgScore: 0 };
+  }
+
+  const scored = results
+    .map((result) => ({
+      text: result.payload?.text || "",
+      source: result.payload?.source || "unknown",
+      chunkIndex: result.payload?.chunkIndex ?? 0,
+      retrievalScore: result.score || 0,
+      rerankScore: cosineSimilarity(queryVector, result.vector || []),
+    }))
+    .filter((chunk) => chunk.text);
+
+  scored.sort((a, b) => b.rerankScore - a.rerankScore);
+
+  const filtered = scored.slice(0, 5).filter((chunk) => chunk.rerankScore >= 0.01);
+  const scores = filtered.map((chunk) => chunk.rerankScore);
+
+  return {
+    chunks: filtered,
+    scores,
+    maxScore: scored[0]?.rerankScore || 0,
+    avgScore: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : 0,
+  };
+}
+
+function cosineSimilarity(a, b) {
+  if (!a.length || !b.length || a.length !== b.length) return 0;
+
+  let dot = 0;
+  let magA = 0;
+  let magB = 0;
+
+  for (let i = 0; i < a.length; i += 1) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+
+  if (!magA || !magB) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+async function evaluateRetrieval(query, chunks) {
+  if (!chunks.length) return { sufficient: false, rawResponse: "NO_CHUNKS" };
+
+  const chunkText = chunks
+    .map((chunk, index) => `[${index + 1}] Source: "${chunk.source}"\n${chunk.text}`)
+    .join("\n\n---\n\n");
+
+  const raw = await utilityCompletion({
+    fallback: "SUFFICIENT",
+    maxTokens: 10,
+    messages: [
+      {
+        role: "system",
+        content: "You strictly evaluate retrieved chunks for a RAG system. Reply with only SUFFICIENT or INSUFFICIENT.",
+      },
+      {
+        role: "user",
+        content: `User Query: ${query}\n\nRetrieved Chunks:\n${chunkText}\n\nDo the chunks contain enough specific information to answer?`,
+      },
+    ],
+  });
+
+  const normalized = raw.toUpperCase();
+  return {
+    sufficient: normalized.includes("SUFFICIENT") && !normalized.includes("INSUFFICIENT"),
+    rawResponse: normalized,
+  };
+}
+
+async function prepareAnswerContext(query, sessionId) {
+  const expandedQuery = await expandQuery(query);
+  let result = await retrieveAndRerank(expandedQuery, sessionId);
+  let usedReformulation = false;
+
+  if (!result.chunks.length || result.maxScore < 0.2) {
+    const reformulated = await reformulateQuery(query);
+    const expandedReformulated = await expandQuery(reformulated);
+    const retry = await retrieveAndRerank(expandedReformulated, sessionId);
+
+    if (retry.maxScore >= result.maxScore) {
+      result = retry;
+      usedReformulation = true;
+    }
+  }
+
+  const evaluation = await evaluateRetrieval(query, result.chunks);
+
+  return {
+    ...result,
+    expandedQuery,
+    usedReformulation,
+    evaluation,
+  };
+}
+
+async function createChatStream({ query, sessionId, history = [] }) {
+  if (!query) throw new Error("query is required");
+  if (!sessionId) throw new Error("sessionId is required");
+
+  const context = await prepareAnswerContext(query, sessionId);
+
+  if (!context.chunks.length) {
+    return textToAsyncIterable(
+      "I couldn't find relevant information in your uploaded documents. Try rephrasing your question or uploading a different document."
+    );
+  }
+
+  const contextParts = context.chunks.map((chunk, index) => {
+    return `[Chunk ${index + 1} from "${chunk.source}" | Relevance: ${(chunk.rerankScore * 100).toFixed(1)}%]\n${chunk.text}`;
+  });
+
+  const lowConfidence =
+    !context.evaluation.sufficient || context.maxScore < 0.2
+      ? "\nThe retrieved context may be incomplete or only partially relevant. Use what is present, but do not invent missing facts."
+      : "";
+
+  const previousConversation = Array.isArray(history) && history.length
+    ? history
+        .slice(-8)
+        .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.content}`)
+        .join("\n")
+    : "";
+
+  const messages = [
+    {
+      role: "system",
+      content: `You are an intelligent AI research assistant for Mini-NotebookLM.
+
+Use only the retrieved document context below. If the answer is not supported by the context, say you could not find sufficient information in the uploaded documents.
+
+Always cite the source document name when referencing facts. Use concise Markdown.
+
+Retrieved context:
+${contextParts.join("\n\n---\n\n")}${lowConfidence}`,
+    },
+  ];
+
+  if (previousConversation) {
+    messages.push({
+      role: "user",
+      content: `Previous conversation:\n${previousConversation}`,
+    });
+  }
+
+  messages.push({ role: "user", content: query });
+
+  const stream = await openai.chat.completions.create({
+    model: ANSWER_MODEL,
+    messages,
+    temperature: 0.2,
+    stream: true,
+  });
+
+  return streamText(stream);
+}
+
+async function* streamText(stream) {
+  for await (const chunk of stream) {
+    const content = chunk.choices[0]?.delta?.content || "";
+    if (content) yield content;
+  }
+}
+
+async function* textToAsyncIterable(text) {
+  yield text;
+}
+
+async function deleteSession(sessionId) {
+  if (!sessionId) throw new Error("sessionId is required");
+  await ensureCollection();
+  await qdrant.delete(COLLECTION_NAME, {
+    wait: true,
+    filter: sessionFilter(sessionId),
+  });
+}
+
+async function healthCheck() {
+  const qdrantHealth = await qdrant.getCollections().then(() => "ok").catch((error) => error.message);
+  return {
+    ok: qdrantHealth === "ok",
+    qdrant: qdrantHealth,
+    collection: COLLECTION_NAME,
+    embeddingModel: EMBEDDING_MODEL,
+    answerModel: ANSWER_MODEL,
+    utilityModel: UTILITY_MODEL,
+  };
+}
+
+export {
+  createChatStream,
+  deleteSession,
+  extractTextFromFile,
+  healthCheck,
+  indexDocumentFile,
+  indexDocumentText,
+};
